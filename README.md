@@ -16,7 +16,7 @@ It handles GigaChat OAuth locally, caches the access token in memory, refreshes 
 Install dependencies with Poetry:
 
 ```bash
-poetry env use python3.13
+poetry env use python3.12
 poetry install
 ```
 
@@ -48,7 +48,7 @@ This is the preferred compatibility test for Mattermost Agents because LiteLLM
 already implements an OpenAI-compatible proxy and a GigaChat provider.
 
 ```bash
-poetry env use python3.13
+poetry env use python3.12
 poetry install
 set -a
 source .env
@@ -60,8 +60,14 @@ Configure Mattermost Agents for LiteLLM with:
 
 - Base URL: `http://127.0.0.1:4000/v1`
 - API key: value of `PROXY_API_KEY`
-- Model: `GigaChat`
+- Model: `GigaChat` or `gpt-4o`
 - Use Responses API: disabled
+
+`litellm_config.yaml` also registers common OpenAI model aliases and a wildcard
+route to GigaChat, because some Mattermost Agents requests can still send
+`gpt-4o` even when the configured provider model is different. The LiteLLM
+config disables SSL verification for GigaChat requests in the same environment
+where `GIGACHAT_VERIFY_SSL=false` is needed by the local FastAPI proxy.
 
 ## Mattermost configuration
 
