@@ -1,0 +1,9 @@
+model_list:
+  - model_name: GigaChat
+    litellm_params:
+      model: gigachat/GigaChat
+      api_key: os.environ/GIGACHAT_CREDENTIALS
+      api_base: os.environ/GIGACHAT_API_BASE_URL
+
+general_settings:
+  master_key: os.environ/PROXY_API_KEY
