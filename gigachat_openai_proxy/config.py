@@ -20,6 +20,10 @@ class Settings:
     host: str
     port: int
     proxy_api_key: str | None
+    litellm_base_url: str | None
+    litellm_api_key: str | None
+    mattermost_site_url: str | None
+    mattermost_access_token: str | None
     gigachat_auth_key: str
     gigachat_scope: str
     gigachat_token_url: str
@@ -34,18 +38,36 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        litellm_base_url = os.getenv("LITELLM_BASE_URL")
+        if litellm_base_url:
+            litellm_base_url = litellm_base_url.rstrip("/")
+
         auth_key = (
             os.getenv("GIGACHAT_CREDENTIALS")
             or os.getenv("GIGACHAT_AUTH_KEY")
             or ""
         ).strip()
-        if not auth_key:
-            raise RuntimeError("GIGACHAT_CREDENTIALS is required")
+        if not auth_key and not litellm_base_url:
+            raise RuntimeError(
+                "GIGACHAT_CREDENTIALS is required unless LITELLM_BASE_URL is set"
+            )
+
+        mattermost_site_url = os.getenv("MATTERMOST_SITE_URL")
+        if mattermost_site_url:
+            mattermost_site_url = mattermost_site_url.rstrip("/")
 
         return cls(
             host=os.getenv("HOST", "127.0.0.1"),
             port=int(os.getenv("PORT", "8080")),
             proxy_api_key=os.getenv("PROXY_API_KEY") or None,
+            litellm_base_url=litellm_base_url,
+            litellm_api_key=os.getenv("LITELLM_API_KEY")
+            or os.getenv("PROXY_API_KEY")
+            or None,
+            mattermost_site_url=mattermost_site_url,
+            mattermost_access_token=os.getenv("MATTERMOST_ACCESS_TOKEN")
+            or os.getenv("MATTERMOST_BOT_TOKEN")
+            or None,
             gigachat_auth_key=auth_key,
             gigachat_scope=os.getenv("GIGACHAT_SCOPE", DEFAULT_SCOPE),
             gigachat_token_url=os.getenv(

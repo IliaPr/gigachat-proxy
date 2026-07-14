@@ -17,7 +17,8 @@ dependencies = [
     "opentelemetry-sdk (==1.28.0)",
     "opentelemetry-exporter-otlp (==1.28.0)",
     "opentelemetry-instrumentation-fastapi (==0.49b0)",
-    "prisma (>=0.11.0,<1.0)"
+    "prisma (>=0.11.0,<1.0)",
+    "openpyxl (>=3.1.5,<4.0.0)"
 ]
 
 

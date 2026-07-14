@@ -11,17 +11,32 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from gigachat_openai_proxy.config import Settings
+from gigachat_openai_proxy.file_processors import (
+    FileProcessorError,
+    edit_xlsx_bytes,
+)
 from gigachat_openai_proxy.gigachat import (
     MODEL_ALIASES,
     GigaChatClient,
     GigaChatError,
     normalize_model,
 )
+from gigachat_openai_proxy.litellm import LiteLLMClient
+from gigachat_openai_proxy.mattermost import MattermostClient
 
 
 logging.basicConfig(
@@ -53,6 +68,8 @@ FILE_ID_KEYS = {
 settings = Settings.from_env()
 served_model = normalize_model(settings.gigachat_model)
 gigachat = GigaChatClient(settings)
+litellm = LiteLLMClient(settings) if settings.litellm_base_url else None
+mattermost = MattermostClient(settings)
 
 
 @asynccontextmanager
@@ -60,6 +77,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if litellm is not None:
+            await litellm.close()
+        await mattermost.close()
         await gigachat.close()
 
 
@@ -152,9 +172,13 @@ async def v1_info() -> dict[str, Any]:
         "status": "ok",
         "service": "gigachat-openai-proxy",
         "model": served_model,
+        "upstream": "litellm" if litellm is not None else "gigachat",
+        "mattermost_uploads_configured": mattermost.is_configured,
         "endpoints": [
             "GET /v1/models",
             "POST /v1/chat/completions",
+            "POST /file-processing/excel/edit",
+            "POST /mattermost/file-posts",
         ],
     }
 
@@ -178,6 +202,95 @@ async def models() -> dict[str, Any]:
             for model_id in model_ids
         ],
     }
+
+
+@app.post("/file-processing/excel/edit", dependencies=[Depends(require_proxy_auth)])
+async def edit_excel_file(
+    operations: str = Form(...),
+    file: UploadFile = File(...),
+    output_filename: str | None = Form(default=None),
+) -> Response:
+    try:
+        operations_payload = json.loads(operations)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"operations must be valid JSON: {exc.msg}",
+        ) from exc
+
+    content = await file.read()
+    try:
+        output_bytes, summary = edit_xlsx_bytes(content, operations_payload)
+    except FileProcessorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("excel processor failed")
+        raise HTTPException(
+            status_code=422,
+            detail=f"failed to process xlsx file: {type(exc).__name__}",
+        ) from exc
+
+    filename = safe_attachment_filename(
+        output_filename or edited_filename(file.filename, ".xlsx")
+    )
+    return Response(
+        content=output_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Processor-Summary": json.dumps(summary, ensure_ascii=True),
+        },
+    )
+
+
+@app.post("/mattermost/file-posts", dependencies=[Depends(require_proxy_auth)])
+async def mattermost_file_post(
+    channel_id: str = Form(...),
+    message: str = Form(""),
+    file: UploadFile = File(...),
+    root_id: str | None = Form(default=None),
+) -> JSONResponse:
+    if not mattermost.is_configured:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "MATTERMOST_SITE_URL and MATTERMOST_ACCESS_TOKEN are required"
+                }
+            },
+        )
+
+    content = await file.read()
+    filename = file.filename or "artifact"
+    file_ids = await mattermost.upload_file_bytes(
+        channel_id=channel_id,
+        filename=filename,
+        content=content,
+        content_type=file.content_type,
+    )
+    post = await mattermost.create_post(
+        channel_id=channel_id,
+        message=message,
+        file_ids=file_ids,
+        root_id=root_id,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={"file_ids": file_ids, "post": post},
+    )
+
+
+def edited_filename(filename: str | None, extension: str) -> str:
+    if not filename:
+        return f"edited{extension}"
+    if filename.lower().endswith(extension):
+        return f"{filename[:-len(extension)]}-edited{extension}"
+    return f"{filename}-edited{extension}"
+
+
+def safe_attachment_filename(filename: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+    return safe or "edited.xlsx"
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_proxy_auth)])
@@ -278,18 +391,25 @@ async def chat_completions(request: Request) -> Response:
                 return JSONResponse(status_code=200, content=generic_tool_completion)
         else:
             logger.info(
-                "mattermost tool handling disabled; forwarding chat to GigaChat")
+                "mattermost tool handling disabled; forwarding chat to %s",
+                upstream_name(),
+            )
 
         if payload.get("stream") is True:
+            stream = (
+                openai_sse_from_litellm_stream(payload)
+                if litellm is not None
+                else openai_sse_from_gigachat_completion(payload)
+            )
             return StreamingResponse(
-                openai_sse_from_gigachat_completion(payload),
+                stream,
                 media_type="text/event-stream",
                 headers=stream_headers(close_connection=True),
             )
 
-        response = await gigachat.chat_completions(payload)
+        response = await upstream_chat_completions(payload)
         if response.status_code >= 400:
-            return openai_error_response(response)
+            return openai_error_response(response, provider=upstream_name())
 
         return JSONResponse(
             status_code=200,
@@ -490,10 +610,13 @@ async def maybe_generic_tool_completion(payload: dict[str, Any]) -> dict[str, An
         return None
 
     decision_payload = build_tool_decision_payload(payload, tools, messages)
-    response = await gigachat.chat_completions(decision_payload)
+    response = await upstream_chat_completions(decision_payload)
     if response.status_code >= 400:
         logger.warning(
-            "generic MCP tool decision failed status=%s", response.status_code)
+            "generic MCP tool decision failed upstream=%s status=%s",
+            upstream_name(),
+            response.status_code,
+        )
         return None
 
     completion = normalize_chat_completion_response(
@@ -913,14 +1036,24 @@ def normalize_chat_completion_response(
     }
 
 
-def openai_error_response(response: Any) -> JSONResponse:
+async def upstream_chat_completions(payload: dict[str, Any]) -> Any:
+    if litellm is not None:
+        return await litellm.chat_completions(payload)
+    return await gigachat.chat_completions(payload)
+
+
+def upstream_name() -> str:
+    return "LiteLLM" if litellm is not None else "GigaChat"
+
+
+def openai_error_response(response: Any, *, provider: str) -> JSONResponse:
     details: Any
     try:
         details = response.json()
     except ValueError:
         details = response.text
 
-    message = "GigaChat API request failed"
+    message = f"{provider} API request failed"
     if isinstance(details, dict):
         message = str(details.get("message")
                       or details.get("error") or message)
@@ -932,7 +1065,7 @@ def openai_error_response(response: Any) -> JSONResponse:
         content={
             "error": {
                 "message": message,
-                "type": "gigachat_error",
+                "type": f"{provider.lower()}_error",
                 "code": response.status_code,
                 "details": details,
             }
@@ -1005,6 +1138,32 @@ async def openai_sse_from_gigachat_stream(payload: dict[str, Any]) -> AsyncItera
         logger.exception("gigachat streaming request crashed")
         yield openai_sse_error_text(
             f"GigaChat API request failed: {type(exc).__name__}: {exc}",
+            payload,
+        )
+
+
+async def openai_sse_from_litellm_stream(payload: dict[str, Any]) -> AsyncIterator[bytes]:
+    if litellm is None:
+        yield openai_sse_error_text("LiteLLM upstream is not configured", payload)
+        return
+
+    try:
+        async with asyncio.timeout(settings.request_timeout):
+            async for chunk in litellm.stream_chat_completions(payload):
+                yield chunk
+    except TimeoutError:
+        logger.warning(
+            "litellm streaming request timed out after %.1fs",
+            settings.request_timeout,
+        )
+        yield openai_sse_error_text(
+            f"LiteLLM API request timed out after {settings.request_timeout:.0f}s",
+            payload,
+        )
+    except Exception as exc:
+        logger.exception("litellm streaming request crashed")
+        yield openai_sse_error_text(
+            f"LiteLLM API request failed: {type(exc).__name__}: {exc}",
             payload,
         )
 
