@@ -66,6 +66,67 @@ Configure Mattermost Agents for LiteLLM with:
 This direct route is simplest, but it bypasses the FastAPI adapter and therefore
 cannot use the adapter's Mattermost attachment/tool handling.
 
+### Run LiteLLM in the background with systemd (without Docker)
+
+The repository contains a ready-to-use unit at
+`deploy/mattermostai-litellm.service`. The example assumes a Linux server with
+systemd, Python 3.12, and the project installed in `/opt/mattermostai`.
+
+Create a service account and copy the project to the server:
+
+```bash
+sudo useradd --system --home-dir /var/lib/mattermostai --create-home mattermostai
+sudo mkdir -p /opt/mattermostai /etc/mattermostai
+sudo chown mattermostai:mattermostai /opt/mattermostai
+```
+
+After cloning or copying the repository into `/opt/mattermostai`, install the
+locked dependencies into an in-project virtual environment:
+
+```bash
+cd /opt/mattermostai
+sudo -u mattermostai python3.12 -m venv .venv
+sudo -u mattermostai .venv/bin/pip install 'poetry==2.3.2'
+sudo -u mattermostai .venv/bin/poetry install --no-root
+```
+
+Copy `deploy/litellm.env.example` to `/etc/mattermostai/litellm.env` and replace
+both secret values. At minimum it must contain:
+
+```dotenv
+GIGACHAT_CREDENTIALS=base64-client-secret-or-auth-key
+GIGACHAT_API_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
+PROXY_API_KEY=replace-with-a-long-random-secret
+```
+
+Protect the secrets and install the unit:
+
+```bash
+sudo chown root:mattermostai /etc/mattermostai/litellm.env
+sudo chmod 640 /etc/mattermostai/litellm.env
+sudo cp deploy/mattermostai-litellm.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mattermostai-litellm
+```
+
+Check the process, logs, and API:
+
+```bash
+systemctl status mattermostai-litellm
+journalctl -u mattermostai-litellm -f
+curl http://127.0.0.1:4000/health/liveliness
+```
+
+The unit listens only on `127.0.0.1:4000`. This is appropriate when Mattermost
+is on the same host or a local reverse proxy provides TLS. If Mattermost runs on
+another host, expose LiteLLM through an HTTPS reverse proxy; do not publish the
+unencrypted API directly to the internet. After changing dependencies or code,
+run `.venv/bin/poetry install --no-root` and restart with:
+
+```bash
+sudo systemctl restart mattermostai-litellm
+```
+
 `litellm_config.yaml` also registers common OpenAI model aliases and a wildcard
 route to GigaChat, because some Mattermost Agents requests can still send
 `gpt-4o` even when the configured provider model is different. The LiteLLM
