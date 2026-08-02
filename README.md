@@ -1,289 +1,286 @@
-# GigaChat OpenAI-compatible proxy
+# MattermostAI
 
-FastAPI proxy for using GigaChat from clients that only support an OpenAI-compatible provider, including Mattermost agents.
+OpenAI-совместимый шлюз для подключения **GigaChat** к **Mattermost Agents**.
+Сервис преобразует запросы Chat Completions, возвращает совместимые потоковые
+ответы, связывает инструменты Mattermost с моделью на стороне сервера.
 
-The proxy exposes:
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
+![API](https://img.shields.io/badge/API-OpenAI--compatible-412991)
 
-- `GET /healthz`
-- `GET /v1`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
+## Зачем нужен проект
 
-It handles GigaChat OAuth locally, caches the access token in memory, refreshes it before expiry, and forwards chat completion requests to GigaChat.
+Mattermost Agents умеет работать с OpenAI-совместимыми провайдерами, но
+GigaChat использует собственную OAuth-авторизацию и отличается некоторыми
+деталями API. Поэтому для интеграции недостаточно просто заменить адрес
+сервера.
 
-## Run
+MattermostAI выступает слоем совместимости между двумя системами:
 
-Install dependencies with Poetry:
+- сопоставляет распространённые названия моделей OpenAI, например `gpt-4o`,
+  с моделью GigaChat;
+- получает, кеширует и своевременно обновляет OAuth-токен GigaChat;
+- нормализует неподдерживаемые поля запросов и структуру ответов;
+- поддерживает обычные ответы и потоковую передачу через Server-Sent Events;
+- преобразует MCP-инструменты Mattermost в OpenAI-совместимые tool calls;
+- работает напрямую с GigaChat или в качестве адаптера перед LiteLLM.
+
+## Архитектура
+
+```mermaid
+flowchart LR
+    MM["Mattermost Agents"] -->|"OpenAI Chat Completions"| API["FastAPI-адаптер"]
+    API -->|"прямой режим"| GC["GigaChat API"]
+    API -->|"режим адаптера"| LLM["LiteLLM Proxy"]
+    LLM --> GC
+
+    API <-->|"tool calls и результаты"| MM
+```
+
+За исключением OAuth-токена в памяти, адаптер не хранит состояние. Благодаря
+этому его можно разворачивать в нескольких экземплярах за обратным прокси.
+
+## Ключевые инженерные решения
+
+- **Асинхронная обработка запросов.** FastAPI и `httpx` позволяют выполнять
+  обращения к внешним сервисам и передавать потоковые ответы без блокировки.
+- **Безопасное обновление OAuth-токена.** Асинхронная блокировка предотвращает
+  одновременное обновление токена несколькими конкурентными запросами.
+- **Совместимость протоколов.** Ответы, ошибки, причины завершения, tool calls и
+  SSE-события приводятся к формату, ожидаемому OpenAI-клиентами.
+- **Защита от зависших запросов.** Общий и idle-таймауты позволяют различать
+  медленные, оборванные и не полностью переданные запросы.
+- **Гибкая топология.** Сервис может обращаться к GigaChat напрямую,
+  маршрутизировать запросы через LiteLLM или совмещать LiteLLM с логикой
+  адаптера для Mattermost.
+- **Готовность к эксплуатации.** Предусмотрены Bearer-аутентификация, health
+  check, структурированные журналы запросов и systemd unit с ограничениями
+  безопасности.
+
+## Технологии
+
+| Область | Технологии |
+| --- | --- |
+| API | Python 3.12, FastAPI, Uvicorn |
+| HTTP и потоковые ответы | httpx, SSE |
+| Шлюз к модели | GigaChat API, LiteLLM |
+| Корпоративный мессенджер | Mattermost Agents |
+| Управление зависимостями | Poetry |
+| Развёртывание | systemd |
+
+## API
+
+| Метод | Эндпоинт | Назначение |
+| --- | --- | --- |
+| `GET` | `/healthz` | Проверка доступности сервиса |
+| `GET` | `/v1` | Информация о сервисе и upstream-провайдере |
+| `GET` | `/v1/models` | Список моделей и поддерживаемых псевдонимов |
+| `POST` | `/v1/chat/completions` | OpenAI-совместимые ответы модели |
+
+Если задан `PROXY_API_KEY`, защищённые эндпоинты требуют заголовок
+`Authorization: Bearer <key>`. Проверка доступности и общая информация о
+сервисе остаются публичными.
+
+## Быстрый запуск
+
+### Требования
+
+- Python 3.12 или 3.13;
+- Poetry;
+- учётные данные GigaChat API.
+
+### 1. Установка зависимостей
 
 ```bash
 poetry env use python3.12
 poetry install
 ```
+
+### 2. Настройка окружения
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`, then export it into the shell:
-
-```bash
-set -a
-source .env
-set +a
-poetry run uvicorn gigachat_openai_proxy.main:app --host 127.0.0.1 --port 8080
-```
-
-The service will listen on `http://127.0.0.1:8080` by default.
-
-You can also run the console script:
-
-```bash
-poetry run gigachat-openai-proxy
-```
-
-## LiteLLM proxy
-
-The project can also run through LiteLLM Proxy instead of the local FastAPI proxy.
-This is the preferred compatibility test for Mattermost Agents because LiteLLM
-already implements an OpenAI-compatible proxy and a GigaChat provider.
-
-```bash
-poetry env use python3.12
-poetry install
-set -a
-source .env
-set +a
-poetry run litellm --config litellm_config.yaml --host 127.0.0.1 --port 4000
-```
-
-Configure Mattermost Agents for LiteLLM with:
-
-- Base URL: `http://127.0.0.1:4000/v1`
-- API key: value of `PROXY_API_KEY`
-- Model: `GigaChat` or `gpt-4o`
-- Use Responses API: disabled
-
-This direct route is simplest, but it bypasses the FastAPI adapter and therefore
-cannot use the adapter's Mattermost attachment/tool handling.
-
-### Run LiteLLM in the background with systemd (without Docker)
-
-The repository contains a ready-to-use unit at
-`deploy/mattermostai-litellm.service`. The example assumes a Linux server with
-systemd, Python 3.12, and the project installed in `/opt/mattermostai`.
-
-Create a service account and copy the project to the server:
-
-```bash
-sudo useradd --system --home-dir /var/lib/mattermostai --create-home mattermostai
-sudo mkdir -p /opt/mattermostai /etc/mattermostai
-sudo chown mattermostai:mattermostai /opt/mattermostai
-```
-
-After cloning or copying the repository into `/opt/mattermostai`, install the
-locked dependencies into an in-project virtual environment:
-
-```bash
-cd /opt/mattermostai
-sudo -u mattermostai python3.12 -m venv .venv
-sudo -u mattermostai .venv/bin/pip install 'poetry==2.3.2'
-sudo -u mattermostai .venv/bin/poetry install --no-root
-```
-
-Copy `deploy/litellm.env.example` to `/etc/mattermostai/litellm.env` and replace
-both secret values. At minimum it must contain:
+Как минимум замените в `.env` следующие значения:
 
 ```dotenv
 GIGACHAT_CREDENTIALS=base64-client-secret-or-auth-key
-GIGACHAT_API_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
 PROXY_API_KEY=replace-with-a-long-random-secret
 ```
 
-Protect the secrets and install the unit:
+В production-среде оставляйте проверку TLS включённой. Если сервер не доверяет
+необходимой цепочке сертификатов, укажите путь к подходящему PEM-файлу в
+`GIGACHAT_CA_BUNDLE`, а не отключайте проверку сертификатов.
+
+### 3. Запуск адаптера
 
 ```bash
-sudo chown root:mattermostai /etc/mattermostai/litellm.env
-sudo chmod 640 /etc/mattermostai/litellm.env
-sudo cp deploy/mattermostai-litellm.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mattermostai-litellm
+poetry run uvicorn gigachat_openai_proxy.main:app \
+  --host 127.0.0.1 \
+  --port 8080
 ```
 
-Check the process, logs, and API:
-
-```bash
-systemctl status mattermostai-litellm
-journalctl -u mattermostai-litellm -f
-curl http://127.0.0.1:4000/health/liveliness
-```
-
-The unit listens only on `127.0.0.1:4000`. This is appropriate when Mattermost
-is on the same host or a local reverse proxy provides TLS. If Mattermost runs on
-another host, expose LiteLLM through an HTTPS reverse proxy; do not publish the
-unencrypted API directly to the internet. After changing dependencies or code,
-run `.venv/bin/poetry install --no-root` and restart with:
-
-```bash
-sudo systemctl restart mattermostai-litellm
-```
-
-`litellm_config.yaml` also registers common OpenAI model aliases and a wildcard
-route to GigaChat, because some Mattermost Agents requests can still send
-`gpt-4o` even when the configured provider model is different. The LiteLLM
-config disables SSL verification for GigaChat requests in the same environment
-where `GIGACHAT_VERIFY_SSL=false` is needed by the local FastAPI proxy.
-
-## Adapter in front of LiteLLM
-
-For Mattermost attachment handling while still using LiteLLM as the model
-upstream, run both services:
-
-```bash
-poetry run litellm --config litellm_config.yaml --host 127.0.0.1 --port 4000
-```
-
-In another shell, set:
-
-```bash
-LITELLM_BASE_URL=http://127.0.0.1:4000/v1
-LITELLM_API_KEY=$PROXY_API_KEY
-ENABLE_MATTERMOST_TOOLS=true
-```
-
-Then run the FastAPI adapter:
-
-```bash
-poetry run uvicorn gigachat_openai_proxy.main:app --host 127.0.0.1 --port 8080
-```
-
-Configure Mattermost Agents with the adapter URL:
-
-- Base URL: `http://127.0.0.1:8080/v1`
-- API key: value of `PROXY_API_KEY`
-- Model: `GigaChat` or `gpt-4o`
-- Use Responses API: disabled
-
-With `LITELLM_BASE_URL` set, `/v1/chat/completions` forwards normal model calls
-to LiteLLM. The adapter still intercepts Mattermost tool loops, including the
-synthetic `read_file` calls used for attachments.
-
-## File processor tools
-
-For generated files, the model should call a tool rather than trying to return
-binary data in a chat response. The adapter exposes a tool-friendly Excel
-processor endpoint:
-
-```bash
-curl http://127.0.0.1:8080/file-processing/excel/edit \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -F file=@/path/to/input.xlsx \
-  -F output_filename=edited.xlsx \
-  -F 'operations={
-    "operations": [
-      {"op": "set_cell", "sheet": "Sheet1", "cell": "A1", "value": "Updated"},
-      {"op": "append_row", "sheet": "Sheet1", "values": ["Total", 123]},
-      {"op": "set_column_width", "sheet": "Sheet1", "column": "A", "width": 24}
-    ]
-  }' \
-  --output edited.xlsx
-```
-
-Supported Excel operations:
-
-- `create_sheet`: `{"op":"create_sheet","title":"Report"}`
-- `rename_sheet`: `{"op":"rename_sheet","sheet":"Sheet1","title":"Report"}`
-- `delete_sheet`: `{"op":"delete_sheet","sheet":"Old"}`
-- `set_cell`: `{"op":"set_cell","sheet":"Report","cell":"B2","value":42}`
-- `append_row`: `{"op":"append_row","sheet":"Report","values":["A","B"]}`
-- `set_column_width`: `{"op":"set_column_width","sheet":"Report","column":"A","width":20}`
-- `style_cell`: `{"op":"style_cell","sheet":"Report","cell":"A1","bold":true,"fill_color":"#FFE599"}`
-
-The intended Agents integration is:
-
-1. Agents/tool gets the original file bytes from Mattermost.
-2. The tool asks the model for explicit JSON operations.
-3. The tool calls `/file-processing/excel/edit`.
-4. The tool uploads the returned `.xlsx` back to the same thread.
-
-If Agents does not expose an upload/create-file tool and this external adapter
-must upload directly through the Mattermost REST API, also set:
-
-```bash
-MATTERMOST_SITE_URL=https://mattermost.example.com
-MATTERMOST_ACCESS_TOKEN=mattermost-personal-or-bot-access-token
-```
-
-This is not required when Mattermost Agents exposes its own tool for uploading
-or creating files. In that case the adapter should route a tool call back to
-Agents instead of using Mattermost REST credentials.
-
-The upload/post helper is exposed as an authenticated multipart endpoint for
-trusted server-side tools:
-
-```bash
-curl http://127.0.0.1:8080/mattermost/file-posts \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -F channel_id=CHANNEL_ID \
-  -F message="Edited file" \
-  -F file=@/path/to/edited.xlsx
-```
-
-## Mattermost configuration
-
-Configure the Mattermost agents OpenAI-compatible provider with:
-
-- Base URL: `http://127.0.0.1:8080/v1`
-- API key: value of `PROXY_API_KEY`, or any non-empty value if `PROXY_API_KEY` is unset
-- Model: value of `GIGACHAT_MODEL`, for example `GigaChat`
-- Use Responses API: disabled
-
-If Mattermost runs in Docker, `127.0.0.1` points to the container itself. Use the host address reachable from that container instead, for example `http://host.docker.internal:8080/v1` on Docker Desktop.
-
-By default, Mattermost tool handling is disabled and the proxy forwards plain
-chat messages to the configured upstream. Without `LITELLM_BASE_URL`, the
-upstream is GigaChat directly. With `LITELLM_BASE_URL`, the upstream is LiteLLM.
-
-Set `ENABLE_MATTERMOST_TOOLS=true` to enable experimental Mattermost MCP tool routing and attachment reading.
-
-Mattermost Agents can expose readable attachments through its `read_file` tool.
-When tool handling is enabled, this proxy returns synthetic OpenAI-compatible
-`read_file` tool calls when it sees Mattermost file IDs, then converts the
-following tool result into plain text context for the configured upstream.
-
-Office/PDF/TXT attachments are supported through that `read_file` loop when bot tools are enabled.
-
-If an attachment is not read, check the proxy logs for:
-
-- `tool_names=[...]`: must contain `read_file` or a namespaced name ending with `read_file`
-- `message diagnostics=... file_ids=[...]`: must show the attached Mattermost file ID on the latest user message
-- `returning synthetic read_file tool calls count=...`: confirms the proxy asked Mattermost Agents to read the file
-
-When `ENABLE_MATTERMOST_TOOLS=true`, Mattermost MCP/tools are exposed through an
-OpenAI-compatible tool loop. The proxy asks the configured upstream to choose a
-tool, returns `tool_calls` to Mattermost, then converts the following
-`role=tool` result into plain text context for the upstream.
-
-Image attachments are different: Mattermost Agents treats supported images as multimodal files, while GigaChat expects images to be uploaded to `/files` first and then referenced from `messages[].attachments`. This proxy does not yet translate OpenAI-style image payloads into GigaChat file attachments.
-
-For GigaChat Lite, use model id `GigaChat`. The B2B `/models` endpoint may not expose `GigaChat-2-Lite`; if Mattermost sends that name, GigaChat returns `No such model`.
-
-## Smoke test
+Проверьте доступность сервиса:
 
 ```bash
 curl http://127.0.0.1:8080/healthz
 ```
 
+### 4. Тестовый запрос к модели
+
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer change-me" \
+  -H "Authorization: Bearer replace-with-a-long-random-secret" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "GigaChat",
-    "messages": [{"role": "user", "content": "Привет"}],
-    "stream": false
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "user", "content": "Кратко опиши назначение этой интеграции."}
+    ]
   }'
 ```
 
-## TLS notes
+Добавьте `"stream": true`, чтобы получить OpenAI-совместимый SSE-ответ.
 
-If GigaChat TLS verification fails because the required CA is missing locally, set `GIGACHAT_CA_BUNDLE` to a PEM bundle. `GIGACHAT_VERIFY_SSL=false` is configured in `.env.example` for the requested environment, but a CA bundle is preferable in production.
+## Подключение Mattermost Agents
+
+Создайте в Mattermost Agents OpenAI-совместимого провайдера со следующими
+параметрами:
+
+| Параметр | Значение |
+| --- | --- |
+| Base URL | `http://<adapter-host>:8080/v1` |
+| API key | Значение `PROXY_API_KEY` |
+| Model | `GigaChat` или поддерживаемый псевдоним, например `gpt-4o` |
+| Use Responses API | Отключено |
+
+Если Mattermost запущен в Docker, адрес `127.0.0.1` указывает на сам контейнер
+Mattermost, а не на хостовую систему. Используйте доступный из контейнера адрес,
+например `host.docker.internal` в Docker Desktop или внутреннее имя сервиса.
+
+## Режимы работы
+
+### Адаптер напрямую перед GigaChat
+
+Это стандартная и наиболее компактная конфигурация:
+
+```text
+Mattermost Agents -> FastAPI-адаптер -> GigaChat
+```
+
+Оставьте `LITELLM_BASE_URL` незаданным. Адаптер самостоятельно управляет OAuth,
+нормализует запросы, преобразует потоковые ответы и при необходимости
+обрабатывает инструменты Mattermost.
+
+### Только LiteLLM
+
+LiteLLM можно использовать, если требуется только совместимость моделей:
+
+```bash
+poetry run litellm \
+  --config litellm_config.yaml \
+  --host 127.0.0.1 \
+  --port 4000
+```
+
+В этом случае укажите в Mattermost Agents адрес
+`http://127.0.0.1:4000/v1`. Запросы не проходят через FastAPI-адаптер, поэтому
+дополнительная маршрутизация инструментов недоступна.
+
+Перед запуском LiteLLM экспортируйте значения из `.env`, если они ещё не заданы
+в окружении процесса:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+В приложенной конфигурации LiteLLM проверка TLS для upstream-сервиса отключена
+в соответствии с исходным окружением разработки. Перед production-запуском
+включите проверку или настройте доверенный центр сертификации.
+
+### Адаптер перед LiteLLM
+
+Этот вариант подходит, когда LiteLLM отвечает за маршрутизацию моделей, а
+FastAPI-адаптер сохраняет Mattermost-специфичную логику:
+
+```dotenv
+LITELLM_BASE_URL=http://127.0.0.1:4000/v1
+LITELLM_API_KEY=replace-with-the-litellm-key
+ENABLE_MATTERMOST_TOOLS=true
+```
+
+```text
+Mattermost Agents -> FastAPI-адаптер -> LiteLLM -> GigaChat
+```
+
+## Вызов инструментов
+
+Маршрутизация инструментов пока имеет экспериментальный статус и по умолчанию
+отключена. Для её включения задайте:
+
+```dotenv
+ENABLE_MATTERMOST_TOOLS=true
+```
+
+Модель получает компактное описание доступных MCP-схем и выбирает вызов
+инструмента либо финальный текстовый ответ. Имена возвращаемых инструментов
+проверяются по списку, переданному Mattermost.
+
+Текущие ограничения:
+
+- реализован `/v1/chat/completions`, но не Responses API;
+- в прямом режиме GigaChat готовый ответ упаковывается в SSE, а не передаётся
+  по токенам; при работе через LiteLLM upstream-чанки транслируются напрямую;
+- маршрутизацию инструментов необходимо проверять с конкретной версией
+  Mattermost Agents и набором инструментов целевого окружения.
+
+## Переменные окружения
+
+| Переменная | Значение по умолчанию | Назначение |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | Адрес прослушивания адаптера |
+| `PORT` | `8080` | Порт адаптера |
+| `PROXY_API_KEY` | не задано | Bearer-ключ для защищённых эндпоинтов |
+| `GIGACHAT_CREDENTIALS` | — | Данные для Basic-заголовка OAuth GigaChat |
+| `GIGACHAT_SCOPE` | `GIGACHAT_API_B2B` | Область действия OAuth-токена |
+| `GIGACHAT_MODEL` | `GigaChat` | Upstream-модель |
+| `GIGACHAT_TOKEN_URL` | OAuth URL GigaChat | Эндпоинт получения токена |
+| `GIGACHAT_API_BASE_URL` | API URL GigaChat | Базовый адрес API |
+| `GIGACHAT_VERIFY_SSL` | `true` | Проверка TLS-сертификатов upstream-сервиса |
+| `GIGACHAT_CA_BUNDLE` | не задано | Путь к пользовательскому набору CA |
+| `LITELLM_BASE_URL` | не задано | Необязательный адрес LiteLLM `/v1` |
+| `LITELLM_API_KEY` | `PROXY_API_KEY` | Ключ для обращения к LiteLLM |
+| `ENABLE_MATTERMOST_TOOLS` | `false` | Экспериментальная маршрутизация MCP-инструментов |
+| `REQUEST_TIMEOUT` | `120` | Таймаут upstream-запроса в секундах |
+| `REQUEST_BODY_TIMEOUT` | `60` | Общий таймаут чтения тела запроса |
+| `REQUEST_BODY_IDLE_TIMEOUT` | `10` | Idle-таймаут чтения тела запроса |
+
+При работе адаптера через LiteLLM переменная `GIGACHAT_CREDENTIALS` не
+обязательна. Для обратной совместимости также поддерживается имя
+`GIGACHAT_AUTH_KEY`.
+
+
+## Структура проекта
+
+```text
+.
+├── gigachat_openai_proxy/
+│   ├── main.py             # API, потоковые ответы и оркестрация инструментов
+│   ├── gigachat.py         # OAuth и нормализация запросов GigaChat
+│   ├── litellm.py          # Необязательный upstream-клиент LiteLLM
+│   └── config.py           # Настройки из переменных окружения
+├── deploy/                 # Пример развёртывания через systemd
+├── litellm_config.yaml     # Маршруты GigaChat и псевдонимы моделей OpenAI
+├── pyproject.toml
+└── README.md
+```
+
+## Статус проекта
+
+Проект представляет собой работающий прототип интеграции. Реализованы обычные
+и потоковые ответы, псевдонимы моделей, обновление OAuth-токена, опциональная
+маршрутизация через LiteLLM и базовая поддержка MCP-инструментов. Маршрутизация
+инструментов пока имеет экспериментальный статус.
